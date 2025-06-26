@@ -2,17 +2,14 @@
 """
 Hand Gesture Mouse & Scroll Control with MediaPipe and Tkinter GUI.
 
-Captures webcam frames, detects hand landmarks,
-- Tracks index fingertip to move the OS mouse pointer.
-- Detects pinch gesture (thumb + index) to simulate left-click.
-- Detects configurable pinch or finger-hold gesture to scroll.
-
-A Tkinter interface allows real-time tuning of:
-  - click/scroll threshold (px)
-  - scroll speed (px/step)
-  - gesture mode for scrolling
-  - enable/disable scrolling
-  - toggling video display
+Structure:
+  - HandLandmark: enum of MediaPipe hand indices.
+  - GestureConfig: shared configuration for thresholds and modes.
+  - HandDetector: wraps MediaPipe to extract hand landmarks per frame.
+  - GestureProcessor: converts landmarks, detects scroll/click gestures.
+  - VirtualMouseController: moves OS cursor and handles click events.
+  - ScrollController: scrolls the OS viewport based on gestures.
+  - HandGestureApp: coordinates the GUI, video capture, and controllers.
 
 Requirements:
   - mediapipe
@@ -24,266 +21,392 @@ import logging
 import math
 import threading
 import time
-import tkinter as tk
-from enum import Enum, auto
 from dataclasses import dataclass
-from typing import List, Tuple
+from enum import Enum, auto
+from typing import Dict, Tuple, Optional, Any
 
+import numpy as np
 import cv2
 import mediapipe as mp
 import pyautogui
+import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import ttk
+from mediapipe.python.solutions import hands as mp_hands
+from mediapipe.python.solutions import drawing_utils as mp_drawing
+from mediapipe.python.solutions import drawing_styles as mp_drawing_styles
 
-# Type alias for a landmark: (id, x_px, y_px)
-Landmark = Tuple[int, int, int]
 
-# Default configuration values
-DEFAULT_CLICK_THRESHOLD = 25      # pixels (for click/scroll detection)
-DEFAULT_SCROLL_SPEED = 100        # pixels per scroll step
+# -------- Enums --------
+class HandLandmark(Enum):
+    """Enum for MediaPipe hand landmark indices."""
+    WRIST = 0
+    THUMB_CMC = 1
+    THUMB_MCP = 2
+    THUMB_IP = 3
+    THUMB_TIP = 4
+    INDEX_FINGER_MCP = 5
+    INDEX_FINGER_PIP = 6
+    INDEX_FINGER_DIP = 7
+    INDEX_FINGER_TIP = 8
+    MIDDLE_FINGER_MCP = 9
+    MIDDLE_FINGER_PIP = 10
+    MIDDLE_FINGER_DIP = 11
+    MIDDLE_FINGER_TIP = 12
+    RING_FINGER_MCP = 13
+    RING_FINGER_PIP = 14
+    RING_FINGER_DIP = 15
+    RING_FINGER_TIP = 16
+    PINKY_MCP = 17
+    PINKY_PIP = 18
+    PINKY_DIP = 19
+    PINKY_TIP = 20
 
 class ClickMode(Enum):
-    """Gesture modes for scrolling."""
-    INDEX_MIDDLE = auto()  # index & middle fingertips held
-    THUMB_INDEX = auto()   # thumb tip & index PIP joint held
+    """Enum for click gesture modes."""
+    INDEX_MIDDLE = auto()
+    THUMB_INDEX = auto()
+
+# -------- Configuration --------
+DEFAULT_CLICK_THRESHOLD = 25  # px distance
+DEFAULT_SCROLL_SPEED = 100    # px per step
+DEFAULT_SCROLL_DURATION = 0.5  # seconds
+DEFAULT_SMOOTHING = 0.5        # smoothing factor
+DEFAULT_MAX_HANDS = 1          # max hands to detect
+DEFAULT_DET_CONFIDENCE = 0.7   # detection confidence
+DEFAULT_TRACK_CONFIDENCE = 0.7  # tracking confidence
 
 @dataclass
 class GestureConfig:
+    """Configuration for gesture thresholds and scroll speed."""
     click_threshold: int = DEFAULT_CLICK_THRESHOLD
     scroll_speed: int = DEFAULT_SCROLL_SPEED
     mode: ClickMode = ClickMode.THUMB_INDEX
+    scroll_duration: float = DEFAULT_SCROLL_DURATION
+    smoothing: float = DEFAULT_SMOOTHING
+    max_hands: int = DEFAULT_MAX_HANDS
+    det_confidence: float = DEFAULT_DET_CONFIDENCE
+    track_confidence: float = DEFAULT_TRACK_CONFIDENCE
 
+# -------- Hand Detection --------
+class HandDetector:
+    """Wrapper for MediaPipe hand detection."""
+    def __init__(self, max_hands: int = 1, det_conf: float = 0.7, track_conf: float = 0.7):
+        self._mp_hands = mp_hands
+        self._detector = self._mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=max_hands,
+            min_detection_confidence=det_conf,
+            min_tracking_confidence=track_conf,
+        )
+        self._drawer = mp_drawing
+        self._closed = False
+
+    def process(self, frame) -> Optional[Any]:
+        if self._closed or self._detector is None:
+            return None
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self._detector.process(rgb)
+        hand_landmarks = getattr(results, "multi_hand_landmarks", None)
+        if hand_landmarks:
+            return hand_landmarks[0]
+        return None
+
+    def draw(self, frame, hand_landmarks) -> None:
+        self._drawer.draw_landmarks(frame, hand_landmarks, list(self._mp_hands.HAND_CONNECTIONS))
+
+    def close(self) -> None:
+        if not self._closed and self._detector is not None:
+            try:
+                self._detector.close()
+            except Exception:
+                pass
+            self._closed = True
+            self._detector = None
+
+# -------- Gesture Processing --------
+PixelPoint = Tuple[int, int]  # (x_px, y_px)
+
+class GestureProcessor:
+    """Processes hand landmarks for gestures."""
+    @staticmethod
+    def to_pixel_points(hand_landmarks, frame) -> Dict[HandLandmark, PixelPoint]:
+        h, w, _ = frame.shape
+        return {
+            HandLandmark(i): (int(lm.x * w), int(lm.y * h))
+            for i, lm in enumerate(hand_landmarks.landmark)
+        }
+
+    @staticmethod
+    def is_scroll(pts: Dict[HandLandmark, PixelPoint], config: GestureConfig) -> bool:
+        if config.mode == ClickMode.INDEX_MIDDLE:
+            id1, id2 = HandLandmark.INDEX_FINGER_TIP, HandLandmark.MIDDLE_FINGER_TIP
+        else:
+            id1, id2 = HandLandmark.THUMB_TIP, HandLandmark.INDEX_FINGER_PIP
+        x1, y1 = pts[id1]
+        x2, y2 = pts[id2]
+        return math.hypot(x2 - x1, y2 - y1) < config.click_threshold
+
+    @staticmethod
+    def is_click(pts: Dict[HandLandmark, PixelPoint], config: GestureConfig) -> bool:
+        x1, y1 = pts[HandLandmark.INDEX_FINGER_TIP]
+        x2, y2 = pts[HandLandmark.THUMB_TIP]
+        return math.hypot(x2 - x1, y2 - y1) < config.click_threshold
+    
+
+# -------- Controllers --------
 class VirtualMouseController:
-    """
-    Moves the OS mouse pointer based on hand index fingertip.
-    Applies exponential smoothing for jitter reduction.
-    """
-    def __init__(self, smoothing: float = 0.75):
+    """Controls the OS mouse cursor using gestures."""
+    def __init__(self, smoothing: float = 0.5):
         self.screen_w, self.screen_h = pyautogui.size()
         self.smoothing = smoothing
-        self.prev_x = None
-        self.prev_y = None
+        self.prev: Optional[PixelPoint] = None
 
-    def update_cursor(self, index_tip):
-        # index_tip: normalized MediaPipe landmark (x,y in [0..1])
-        target_x = int(index_tip.x * self.screen_w)
-        target_y = int(index_tip.y * self.screen_h)
-        if self.prev_x is None or self.prev_y is None:
-            curr_x, curr_y = target_x, target_y
-        else:
-            curr_x = int(self.prev_x + self.smoothing * (target_x - self.prev_x))
-            curr_y = int(self.prev_y + self.smoothing * (target_y - self.prev_y))
-        pyautogui.moveTo(curr_x, curr_y)
-        self.prev_x, self.prev_y = curr_x, curr_y
+    def move(self, landmark, smoothing: Optional[float] = None) -> None:
+        x = int(landmark.x * self.screen_w)
+        y = int(landmark.y * self.screen_h)
+        factor = smoothing if smoothing is not None else self.smoothing
+        if self.prev:
+            x = int(self.prev[0] + factor * (x - self.prev[0]))
+            y = int(self.prev[1] + factor * (y - self.prev[1]))
+        pyautogui.moveTo(x, y)
+        self.prev = (x, y)
 
-class HandGestureScrollerApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Hand Gesture Mouse & Scroll")
+    def click(self) -> None:
+        pyautogui.click()
+
+class ScrollController:
+    """Controls OS scrolling using gestures."""
+    def __init__(self, config: GestureConfig):
+        self.config = config
+        self.active = False
+
+    def scroll(self, direction: int, duration: float = 0.5) -> None:
+        def _run():
+            self.active = True
+            end = time.time() + duration
+            while time.time() < end:
+                pyautogui.scroll(direction * self.config.scroll_speed)
+                time.sleep(0.05)
+            self.active = False
+        if not self.active:
+            threading.Thread(target=_run, daemon=True).start()
+
+# -------- Main Application --------
+class HandGestureApp:
+    """Main application class for hand gesture control."""
+    def __init__(self, root: tk.Tk):
         self.config = GestureConfig()
-        self.scrolling_enabled = True
-        self.scrolling_thread_active = False
-        self.clicking = False  # track pinch click state
+        self.detector = HandDetector()
+        self.processor = GestureProcessor()
+        self.mouse = VirtualMouseController()
+        self.scroller = ScrollController(self.config)
+
+        self.clicking = False
         self.show_video = tk.BooleanVar(value=True)
 
-        # MediaPipe hands setup
-        self.mp_hands = mp.solutions.hands
-        self.hand_detector = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
-        )
-        self.drawer = mp.solutions.drawing_utils
-
-        # Virtual mouse controller
-        self.virtual_mouse = VirtualMouseController(smoothing=0.7)
-
-        # Video capture
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             raise RuntimeError("Webcam not accessible")
 
+        self.root = root
         self._build_gui()
-        self._update_frame()
+        self._update_loop()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_gui(self) -> None:
+        """Builds the Tkinter GUI with all configuration options."""
+        self.root.title("Hand Gesture Mouse & Scroll")
         # Video panel
         self.video_lbl = ttk.Label(self.root)
         self.video_lbl.pack(fill=tk.BOTH, expand=True)
-
-        # Control panel
-        ctrl = ttk.Frame(self.root, padding=5)
-        ctrl.pack(fill=tk.X)
-
-        # On/Off scroll
-        self.toggle_btn = ttk.Button(ctrl, text="Stop Scrolling", command=self._toggle_scrolling)
-        self.toggle_btn.grid(row=0, column=0, padx=5)
-        self.status_lbl = ttk.Label(ctrl, text="Scrolling: ON", foreground="green")
-        self.status_lbl.grid(row=0, column=1, padx=5)
-
-        # Show video checkbox
-        self.video_cb = ttk.Checkbutton(ctrl, text="Show Video", variable=self.show_video,
-                                        command=self._toggle_video)
-        self.video_cb.grid(row=0, column=2, padx=5)
-
-        # Threshold entry before scale to avoid callback errors
-        ttk.Label(ctrl, text="Threshold (px):").grid(row=1, column=0, sticky=tk.W)
-        self.thresh_entry = ttk.Entry(ctrl, width=5)
-        self.thresh_entry.insert(0, str(self.config.click_threshold))
-        self.thresh_entry.grid(row=1, column=2)
-        self.thresh_entry.bind("<Return>", self._on_thresh_entry)
-        self.thresh_scale = ttk.Scale(ctrl, from_=5, to=100, command=self._on_thresh_change)
-        self.thresh_scale.set(self.config.click_threshold)
-        self.thresh_scale.grid(row=1, column=1, sticky=tk.EW)
-
-        # Speed entry before scale
-        ttk.Label(ctrl, text="Speed (px/step):").grid(row=2, column=0, sticky=tk.W)
-        self.speed_entry = ttk.Entry(ctrl, width=5)
-        self.speed_entry.insert(0, str(self.config.scroll_speed))
-        self.speed_entry.grid(row=2, column=2)
-        self.speed_entry.bind("<Return>", self._on_speed_entry)
-        self.speed_scale = ttk.Scale(ctrl, from_=10, to=500, command=self._on_speed_change)
-        self.speed_scale.set(self.config.scroll_speed)
-        self.speed_scale.grid(row=2, column=1, sticky=tk.EW)
-
-        # Gesture mode dropdown
-        ttk.Label(ctrl, text="Mode:").grid(row=3, column=0, sticky=tk.W)
+        # Controls
+        ctrl = ttk.LabelFrame(self.root, text="Configuration", padding=8)
+        ctrl.pack(fill=tk.X, padx=8, pady=4)
+        # Threshold
+        ttk.Label(ctrl, text="Click Threshold:").grid(row=0, column=0, sticky=tk.W)
+        self.entry_thresh = ttk.Entry(ctrl, width=5)
+        self.entry_thresh.insert(0, str(self.config.click_threshold))
+        self.entry_thresh.grid(row=0, column=1)
+        self.scale_thresh = ttk.Scale(ctrl, from_=5, to=100, command=self._set_thresh)
+        self.scale_thresh.set(self.config.click_threshold)
+        self.scale_thresh.grid(row=0, column=2, sticky=tk.EW)
+        # Speed
+        ttk.Label(ctrl, text="Scroll Speed:").grid(row=1, column=0, sticky=tk.W)
+        self.entry_speed = ttk.Entry(ctrl, width=5)
+        self.entry_speed.insert(0, str(self.config.scroll_speed))
+        self.entry_speed.grid(row=1, column=1)
+        self.scale_speed = ttk.Scale(ctrl, from_=10, to=500, command=self._set_speed)
+        self.scale_speed.set(self.config.scroll_speed)
+        self.scale_speed.grid(row=1, column=2, sticky=tk.EW)
+        # Scroll Duration
+        ttk.Label(ctrl, text="Scroll Duration (s):").grid(row=2, column=0, sticky=tk.W)
+        self.entry_scroll_duration = ttk.Entry(ctrl, width=5)
+        self.entry_scroll_duration.insert(0, "0.5")
+        self.entry_scroll_duration.grid(row=2, column=1)
+        self.scale_scroll_duration = ttk.Scale(ctrl, from_=0.1, to=2.0, orient=tk.HORIZONTAL, command=self._set_scroll_duration)
+        self.scale_scroll_duration.set(0.5)
+        self.scale_scroll_duration.grid(row=2, column=2, sticky=tk.EW)
+        # Smoothing
+        ttk.Label(ctrl, text="Mouse Smoothing:").grid(row=3, column=0, sticky=tk.W)
+        self.entry_smoothing = ttk.Entry(ctrl, width=5)
+        self.entry_smoothing.insert(0, "0.5")
+        self.entry_smoothing.grid(row=3, column=1)
+        self.scale_smoothing = ttk.Scale(ctrl, from_=0.0, to=1.0, command=self._set_smoothing)
+        self.scale_smoothing.set(0.5)
+        self.scale_smoothing.grid(row=3, column=2, sticky=tk.EW)
+        # Max Hands
+        ttk.Label(ctrl, text="Max Hands:").grid(row=4, column=0, sticky=tk.W)
+        self.entry_max_hands = ttk.Entry(ctrl, width=5)
+        self.entry_max_hands.insert(0, "1")
+        self.entry_max_hands.grid(row=4, column=1)
+        self.scale_max_hands = ttk.Scale(ctrl, from_=1, to=2, command=self._set_max_hands)
+        self.scale_max_hands.set(1)
+        self.scale_max_hands.grid(row=4, column=2, sticky=tk.EW)
+        # Detection Confidence
+        ttk.Label(ctrl, text="Detection Confidence:").grid(row=5, column=0, sticky=tk.W)
+        self.entry_det_conf = ttk.Entry(ctrl, width=5)
+        self.entry_det_conf.insert(0, "0.7")
+        self.entry_det_conf.grid(row=5, column=1)
+        self.scale_det_conf = ttk.Scale(ctrl, from_=0.1, to=1.0, command=self._set_det_conf)
+        self.scale_det_conf.set(0.7)
+        self.scale_det_conf.grid(row=5, column=2, sticky=tk.EW)
+        # Tracking Confidence
+        ttk.Label(ctrl, text="Tracking Confidence:").grid(row=6, column=0, sticky=tk.W)
+        self.entry_track_conf = ttk.Entry(ctrl, width=5)
+        self.entry_track_conf.insert(0, "0.7")
+        self.entry_track_conf.grid(row=6, column=1)
+        self.scale_track_conf = ttk.Scale(ctrl, from_=0.1, to=1.0, command=self._set_track_conf)
+        self.scale_track_conf.set(0.7)
+        self.scale_track_conf.grid(row=6, column=2, sticky=tk.EW)
+        # Mode
+        ttk.Label(ctrl, text="Click Mode:").grid(row=7, column=0, sticky=tk.W)
         self.mode_var = tk.StringVar(value=self.config.mode.name)
-        mode_menu = ttk.OptionMenu(ctrl, self.mode_var, self.config.mode.name,
-                                   *[mode.name for mode in ClickMode], command=self._on_mode_change)
-        mode_menu.grid(row=3, column=1, columnspan=2, sticky=tk.EW)
-        ctrl.columnconfigure(1, weight=1)
+        ttk.OptionMenu(ctrl, self.mode_var, self.config.mode.name,
+                       *[m.name for m in ClickMode], command=lambda _: self._set_mode(self.mode_var.get())).grid(row=7, column=1, columnspan=2, sticky=tk.EW)
+        # Show video
+        ttk.Checkbutton(ctrl, text="Show Video", variable=self.show_video).grid(row=8, column=0, columnspan=3)
+        ctrl.columnconfigure(2, weight=1)
 
-    def _toggle_scrolling(self) -> None:
-        self.scrolling_enabled = not self.scrolling_enabled
-        if self.scrolling_enabled:
-            self.toggle_btn.config(text="Stop Scrolling")
-            self.status_lbl.config(text="Scrolling: ON", foreground="green")
-        else:
-            self.toggle_btn.config(text="Start Scrolling")
-            self.status_lbl.config(text="Scrolling: OFF", foreground="red")
+    def _set_thresh(self, val: str) -> None:
+        """Update click threshold from slider."""
+        t = int(float(val))
+        self.config.click_threshold = t
+        self.entry_thresh.delete(0, tk.END)
+        self.entry_thresh.insert(0, str(t))
 
-    def _toggle_video(self) -> None:
-        if self.show_video.get():
-            self.video_lbl.pack(fill=tk.BOTH, expand=True)
-        else:
-            self.video_lbl.pack_forget()
+    def _set_speed(self, val: str) -> None:
+        """Update scroll speed from slider."""
+        s = int(float(val))
+        self.config.scroll_speed = s
+        self.entry_speed.delete(0, tk.END)
+        self.entry_speed.insert(0, str(s))
 
-    def _on_thresh_change(self, val: str) -> None:
-        self.config.click_threshold = int(float(val))
-        # Safely update entry
-        try:
-            self.thresh_entry.delete(0, tk.END)
-            self.thresh_entry.insert(0, str(self.config.click_threshold))
-        except AttributeError:
-            pass
+    def _set_scroll_duration(self, val: str) -> None:
+        d = float(val)
+        self.entry_scroll_duration.delete(0, tk.END)
+        self.entry_scroll_duration.insert(0, str(round(d, 2)))
+        self.scroller.config.scroll_duration = d
 
-    def _on_speed_change(self, val: str) -> None:
-        self.config.scroll_speed = int(float(val))
-        # Safely update entry
-        try:
-            self.speed_entry.delete(0, tk.END)
-            self.speed_entry.insert(0, str(self.config.scroll_speed))
-        except AttributeError:
-            pass
+    def _set_smoothing(self, val: str) -> None:
+        s = float(val)
+        self.entry_smoothing.delete(0, tk.END)
+        self.entry_smoothing.insert(0, str(round(s, 2)))
+        self.mouse.smoothing = s
 
-    def _on_thresh_entry(self, event) -> None:
-        try:
-            val = int(self.thresh_entry.get())
-            self.config.click_threshold = val
-            self.thresh_scale.set(val)
-        except ValueError:
-            pass
+    def _set_max_hands(self, val: str) -> None:
+        m = int(float(val))
+        self.entry_max_hands.delete(0, tk.END)
+        self.entry_max_hands.insert(0, str(m))
+        # Defensive: check for required attributes
+        if not hasattr(self, 'entry_det_conf') or not hasattr(self, 'entry_track_conf'):
+            print("Error: Detection/Tracking confidence entries not initialized.")
+            return
+        # Re-initialize detector with new max_hands
+        if self.detector:
+            self.detector.close()
+        self.detector = HandDetector(max_hands=m,
+                                     det_conf=float(self.entry_det_conf.get()),
+                                     track_conf=float(self.entry_track_conf.get()))
 
-    def _on_speed_entry(self, event) -> None:
-        try:
-            val = int(self.speed_entry.get())
-            self.config.scroll_speed = val
-            self.speed_scale.set(val)
-        except ValueError:
-            pass
+    def _set_det_conf(self, val: str) -> None:
+        c = float(val)
+        self.entry_det_conf.delete(0, tk.END)
+        self.entry_det_conf.insert(0, str(round(c, 2)))
+        if not hasattr(self, 'entry_max_hands') or not hasattr(self, 'entry_track_conf'):
+            print("Error: Max hands/tracking confidence entries not initialized.")
+            return
+        # Re-initialize detector with new confidence
+        if self.detector:
+            self.detector.close()
+        self.detector = HandDetector(max_hands=int(self.entry_max_hands.get()),
+                                     det_conf=c,
+                                     track_conf=float(self.entry_track_conf.get()))
 
-    def _on_mode_change(self, name: str) -> None:
-        self.config.mode = ClickMode[name]
+    def _set_track_conf(self, val: str) -> None:
+        c = float(val)
+        self.entry_track_conf.delete(0, tk.END)
+        self.entry_track_conf.insert(0, str(round(c, 2)))
+        if not hasattr(self, 'entry_max_hands') or not hasattr(self, 'entry_det_conf'):
+            print("Error: Max hands/detection confidence entries not initialized.")
+            return
+        # Re-initialize detector with new confidence
+        if self.detector:
+            self.detector.close()
+        self.detector = HandDetector(max_hands=int(self.entry_max_hands.get()),
+                                     det_conf=float(self.entry_det_conf.get()),
+                                     track_conf=c)
 
-    def _update_frame(self) -> None:
+    def _set_mode(self, mode_name: str) -> None:
+        """Update click mode from dropdown."""
+        self.config.mode = ClickMode[mode_name]
+
+    def _update_loop(self) -> None:
+        """Main update loop for video capture and gesture processing."""
         ret, frame = self.cap.read()
         if ret:
             frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.hand_detector.process(rgb)
-
-            if results.multi_hand_landmarks:
-                hand = results.multi_hand_landmarks[0]
-                pts = self._to_pixel_landmarks(hand, frame)
-                self._draw_landmarks(frame, hand)
-
-                scroll_gesture = self.scrolling_enabled and self._is_click(pts)
-                if scroll_gesture:
-                    # Perform scrolling
-                    _, _, ty = pts[8]
-                    _, _, by = pts[5]
-                    direction = 1 if ty < by else -1
-                    if not self.scrolling_thread_active:
-                        threading.Thread(target=self._scroll_for_duration,
-                                         args=(direction,), daemon=True).start()
+            hand = self.detector.process(frame)
+            if hand and hasattr(hand, 'landmark'):
+                pts = self.processor.to_pixel_points(hand, frame)
+                self.detector.draw(frame, hand)  # Draw landmarks before display
+                # Scroll or pointer
+                if self.processor.is_scroll(pts, self.config):
+                    direction = 1 if pts[HandLandmark.INDEX_FINGER_TIP][1] < pts[HandLandmark.INDEX_FINGER_MCP][1] else -1
+                    self.scroller.scroll(direction)
                 else:
-                    # Pointer movement + click
-                    idx_tip = hand.landmark[8]
-                    thumb_tip = hand.landmark[4]
-                    self.virtual_mouse.update_cursor(idx_tip)
-                    dist = math.hypot(pts[8][1] - pts[4][1], pts[8][2] - pts[4][2])
-                    if dist < self.config.click_threshold and not self.clicking:
-                        pyautogui.click()
+
+                    if(not self.clicking):
+                        # Move cursor
+                        self.mouse.move(hand.landmark[HandLandmark.INDEX_FINGER_TIP.value])
+                        
+                    # Click
+                    if self.processor.is_click(pts, self.config) and not self.clicking:
+                        self.mouse.click()
                         self.clicking = True
-                    elif dist >= self.config.click_threshold and self.clicking:
+                    elif not self.processor.is_click(pts, self.config):
                         self.clicking = False
-
-            # Display video
-            disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(disp)
-            imgtk = ImageTk.PhotoImage(image=img)
+            # Display
             if self.show_video.get():
-                self.video_lbl.imgtk = imgtk
-                self.video_lbl.config(image=imgtk)
-
-        self.root.after(33, self._update_frame)
-
-    def _scroll_for_duration(self, direction: int) -> None:
-        self.scrolling_thread_active = True
-        end_time = time.time() + 0.5
-        while time.time() < end_time and self.scrolling_enabled:
-            pyautogui.scroll(direction * self.config.scroll_speed)
-            time.sleep(0.05)
-        self.scrolling_thread_active = False
-
-    def _to_pixel_landmarks(self, hand_landmarks, frame) -> List[Landmark]:
-        h, w, _ = frame.shape
-        return [(i, int(lm.x*w), int(lm.y*h)) for i, lm in enumerate(hand_landmarks.landmark)]
-
-    def _draw_landmarks(self, frame, hand_landmarks) -> None:
-        self.drawer.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-        h, w, _ = frame.shape
-        for i in (4, 5, 8, 12):
-            lm = hand_landmarks.landmark[i]
-            x, y = int(lm.x*w), int(lm.y*h)
-            cv2.circle(frame, (x, y), 6, (0, 255, 0), cv2.FILLED)
-
-    def _is_click(self, pts: List[Landmark]) -> bool:
-        id1, id2 = (8, 12) if self.config.mode == ClickMode.INDEX_MIDDLE else (4, 6)
-        _, x1, y1 = pts[id1]
-        _, x2, y2 = pts[id2]
-        return math.hypot(x2-x1, y2-y1) < self.config.click_threshold
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = ImageTk.PhotoImage(image=Image.fromarray(rgb_frame))
+                setattr(self.video_lbl, 'imgtk', img)  # Prevent garbage collection (Tkinter idiom)
+                self.video_lbl.config(image=img)
+        self.root.after(33, self._update_loop)
 
     def _on_close(self) -> None:
+        """Cleanup on application close."""
         self.cap.release()
-        self.hand_detector.close()
+        self.detector.close()
         self.root.destroy()
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def main() -> None:
+    """Entry point for the application."""
+    logging.basicConfig(level=logging.INFO)
     root = tk.Tk()
-    HandGestureScrollerApp(root)
+    app = HandGestureApp(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()
